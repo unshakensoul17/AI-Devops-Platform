@@ -78,11 +78,10 @@ async def process_queue_continuously():
                         for log in processed_logs:
 
                             # --- FIX 1: Timestamp conversion ---
-                            ts = log["timestamp"]
+                            ts = log.get("timestamp")
                             if isinstance(ts, str):
-                                ts = datetime.fromisoformat(
-                                    ts.replace("Z", "+00:00")
-                                )
+                                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            ts = ts.replace(tzinfo=None)
 
                             # --- FIX 2: metadata_ instead of metadata ---
                             entry = LogEntry(
