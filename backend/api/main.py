@@ -389,12 +389,13 @@ async def summarize_logs(
     try:
         if not groq_service.client:
             raise HTTPException(status_code=503, detail="Groq AI not configured")
-        
+        start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00")).replace(tzinfo=None)
+        end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00")).replace(tzinfo=None)
         # Fetch logs
         stmt = select(LogEntry).where(
             and_(
-                LogEntry.timestamp >= datetime.fromisoformat(start_time),
-                LogEntry.timestamp <= datetime.fromisoformat(end_time)
+                LogEntry.timestamp >= start_dt,
+                LogEntry.timestamp <= end_dt
             )
         )
         
