@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     
     # Groq AI
     GROQ_API_KEY: str = ""
-    GROQ_MODEL: str = "llama-3.2-3b-preview"
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
     GROQ_MAX_TOKENS: int = 1024
     GROQ_TEMPERATURE: float = 0.3
     
