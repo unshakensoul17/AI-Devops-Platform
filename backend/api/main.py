@@ -1,18 +1,20 @@
 # backend/api/main.py
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
 import logging
 from typing import List, Optional
-import os
+from datetime import datetime, timedelta
+from sqlalchemy import select, func, and_, or_
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import get_settings
-from services.redis_stream_service import RedisStreamService
+from database.connection import get_db, init_db
+from database.models import LogEntry
+from services.queue_service import log_queue
 from services.groq_service import GroqAIService
 from services.log_processor import LogProcessor
-from services.opensearch_client import OpenSearchClient
-from services.cache_service import CacheService
 
 # Setup logging
 logging.basicConfig(
@@ -24,75 +26,140 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # Global services
-stream_service: Optional[RedisStreamService] = None
 groq_service: Optional[GroqAIService] = None
 log_processor: Optional[LogProcessor] = None
-opensearch: Optional[OpenSearchClient] = None
-cache: Optional[CacheService] = None
 active_websockets: List[WebSocket] = []
+background_task: Optional[asyncio.Task] = None
+
+# ============================================
+# BACKGROUND PROCESSING TASK
+# ============================================
+
+async def process_queue_continuously():
+    """
+    Background task that processes logs from the queue.
+    Runs inside the web process - NO separate worker needed!
+    """
+    logger.info("🚀 Starting in-process queue consumer...")
+    
+    from database.connection import async_session_maker
+    
+    while True:
+        try:
+            # Get batch of logs from queue
+            batch = await log_queue.dequeue_batch(
+                batch_size=settings.BATCH_SIZE,
+                timeout=settings.PROCESSING_INTERVAL
+            )
+            
+            if not batch:
+                await asyncio.sleep(1)
+                continue
+            
+            logger.info(f"📦 Processing batch of {len(batch)} logs")
+            
+            # Process each log
+            processed_logs = []
+            for raw_log in batch:
+                try:
+                    processed = await log_processor.process(raw_log)
+                    processed_logs.append(processed)
+                except Exception as e:
+                    logger.error(f"❌ Error processing log: {e}")
+                    log_queue.stats['processing_errors'] += 1
+            
+            # Bulk insert to database
+            if processed_logs:
+                async with async_session_maker() as session:
+                    try:
+                        # Convert to ORM objects
+                        log_entries = [
+                            LogEntry(
+                                id=log['id'],
+                                timestamp=log['timestamp'],
+                                level=log['level'],
+                                message=log['message'],
+                                service=log['service'],
+                                source=log['source'],
+                                environment=log['environment'],
+                                host=log['host'],
+                                error_type=log['error_type'],
+                                stack_trace=log['stack_trace'],
+                                metadata=log['metadata'],
+                                ai_analysis=log['ai_analysis']
+                            )
+                            for log in processed_logs
+                        ]
+                        
+                        session.add_all(log_entries)
+                        await session.commit()
+                        
+                        log_queue.stats['total_processed'] += len(processed_logs)
+                        logger.info(f"✅ Saved {len(processed_logs)} logs to database")
+                        
+                        # Broadcast to WebSockets
+                        for log in processed_logs:
+                            await broadcast_to_websockets(log)
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Database error: {e}")
+                        await session.rollback()
+            
+            # Small delay to prevent tight loop
+            await asyncio.sleep(0.1)
+            
+        except Exception as e:
+            logger.error(f"❌ Error in processing loop: {e}")
+            await asyncio.sleep(5)
+
+# ============================================
+# LIFESPAN EVENTS
+# ============================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    global stream_service, groq_service, log_processor, opensearch, cache
+    global groq_service, log_processor, background_task
     
-    logger.info("🚀 Starting AI DevOps Platform API...")
+    logger.info("🚀 Starting AI DevOps Platform (FREE Edition)...")
     
     try:
-        # Initialize Redis Streams
-        stream_service = RedisStreamService(
-            redis_url=settings.REDIS_URL,
-            stream_name=settings.STREAM_NAME
-        )
-        await stream_service.connect()
+        # Initialize database
+        await init_db()
         
-        # Initialize Groq AI
+        # Initialize services
         groq_service = GroqAIService()
-        
-        # Initialize Log Processor
         log_processor = LogProcessor(groq_service=groq_service)
         
-        # Initialize OpenSearch
-        opensearch = OpenSearchClient(
-            hosts=[{
-                'host': settings.OPENSEARCH_HOST,
-                'port': settings.OPENSEARCH_PORT
-            }],
-            http_auth=(settings.OPENSEARCH_USERNAME, settings.OPENSEARCH_PASSWORD) if settings.OPENSEARCH_USERNAME else None,
-            use_ssl=settings.OPENSEARCH_USE_SSL
-        )
-        await opensearch.connect()
+        # Start background processing task (IN-PROCESS!)
+        background_task = asyncio.create_task(process_queue_continuously())
         
-        # Initialize Cache
-        cache = CacheService(redis_url=settings.REDIS_URL)
-        await cache.connect()
-        
-        logger.info("✅ All services initialized successfully")
+        logger.info("✅ All services initialized")
         
     except Exception as e:
-        logger.error(f"❌ Failed to initialize services: {e}")
+        logger.error(f"❌ Startup failed: {e}")
         raise
     
     yield
     
     # Shutdown
-    logger.info("🔌 Shutting down API...")
+    logger.info("🔌 Shutting down...")
     
-    if stream_service:
-        await stream_service.close()
-    if opensearch:
-        await opensearch.close()
-    if cache:
-        await cache.close()
+    if background_task:
+        background_task.cancel()
+        try:
+            await background_task
+        except asyncio.CancelledError:
+            pass
 
-# Create FastAPI app
+# Create app
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
     lifespan=lifespan
 )
 
-# CORS middleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
@@ -107,39 +174,33 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
         "service": settings.APP_NAME,
         "version": settings.VERSION,
         "status": "running",
-        "environment": settings.ENVIRONMENT
+        "plan": "FREE",
+        "queue_stats": log_queue.get_stats()
     }
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    health = {
-        "status": "healthy",
-        "services": {}
+async def health_check(db: AsyncSession = Depends(get_db)):
+    """Health check"""
+    health = {"status": "healthy", "services": {}}
+    
+    # Check database
+    try:
+        await db.execute(select(func.count()).select_from(LogEntry))
+        health["services"]["database"] = "connected"
+    except Exception as e:
+        health["services"]["database"] = f"error: {str(e)}"
+        health["status"] = "degraded"
+    
+    # Check queue
+    queue_stats = log_queue.get_stats()
+    health["services"]["queue"] = {
+        "size": queue_stats['current_size'],
+        "processed": queue_stats['total_processed']
     }
-    
-    # Check Redis
-    try:
-        if stream_service:
-            await stream_service.client.ping()
-            health["services"]["redis"] = "connected"
-    except Exception as e:
-        health["services"]["redis"] = f"error: {str(e)}"
-        health["status"] = "degraded"
-    
-    # Check OpenSearch
-    try:
-        if opensearch:
-            await opensearch.client.info()
-            health["services"]["opensearch"] = "connected"
-    except Exception as e:
-        health["services"]["opensearch"] = f"error: {str(e)}"
-        health["status"] = "degraded"
     
     # Check Groq
     health["services"]["groq_ai"] = "configured" if groq_service.client else "not_configured"
@@ -152,34 +213,39 @@ async def health_check():
 
 @app.post("/api/logs/ingest")
 async def ingest_log(log_data: dict):
-    """Ingest a single log entry"""
+    """Ingest a single log - goes to in-memory queue"""
     try:
-        # Add to Redis Stream
-        message_id = await stream_service.produce(log_data)
+        success = await log_queue.enqueue(log_data)
         
-        # Also process immediately for WebSocket (optional)
-        if active_websockets:
-            processed = await log_processor.process(log_data)
-            await broadcast_to_websockets(processed)
+        if not success:
+            raise HTTPException(status_code=507, detail="Queue is full")
         
         return {
             "success": True,
-            "message_id": message_id
+            "queued": True,
+            "queue_size": log_queue.queue.qsize()
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Error ingesting log: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/logs/ingest/batch")
-async def ingest_logs_batch(logs: List[dict]):
+async def ingest_batch(logs: List[dict]):
     """Ingest multiple logs"""
     try:
-        count = await stream_service.produce_batch(logs)
+        success_count = 0
+        for log in logs:
+            if await log_queue.enqueue(log):
+                success_count += 1
         
         return {
             "success": True,
-            "count": count
+            "total": len(logs),
+            "queued": success_count,
+            "failed": len(logs) - success_count
         }
         
     except Exception as e:
@@ -187,7 +253,7 @@ async def ingest_logs_batch(logs: List[dict]):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================
-# LOG SEARCH & QUERY
+# LOG QUERY
 # ============================================
 
 @app.get("/api/logs/search")
@@ -197,118 +263,152 @@ async def search_logs(
     service: Optional[str] = None,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
-    size: int = 100
+    limit: int = Query(100, le=1000),
+    db: AsyncSession = Depends(get_db)
 ):
-    """Search logs"""
+    """Search logs in PostgreSQL"""
     try:
-        # Check cache
-        cache_key = f"search:{query}:{level}:{service}:{start_time}:{end_time}:{size}"
-        cached = await cache.get(cache_key)
+        # Build query
+        stmt = select(LogEntry)
         
-        if cached:
-            return cached
+        filters = []
         
-        # Query OpenSearch
-        results = await opensearch.search_logs(
-            query=query,
-            level=level,
-            service=service,
-            start_time=start_time,
-            end_time=end_time,
-            size=size
-        )
+        if query:
+            # PostgreSQL full-text search
+            filters.append(LogEntry.message.ilike(f"%{query}%"))
         
-        # Cache for 60 seconds
-        await cache.set(cache_key, results, expire=60)
+        if level:
+            filters.append(LogEntry.level == level)
         
-        return results
+        if service:
+            filters.append(LogEntry.service == service)
+        
+        if start_time:
+            filters.append(LogEntry.timestamp >= datetime.fromisoformat(start_time))
+        
+        if end_time:
+            filters.append(LogEntry.timestamp <= datetime.fromisoformat(end_time))
+        
+        if filters:
+            stmt = stmt.where(and_(*filters))
+        
+        stmt = stmt.order_by(LogEntry.timestamp.desc()).limit(limit)
+        
+        # Execute
+        result = await db.execute(stmt)
+        logs = result.scalars().all()
+        
+        # Convert to dict
+        return {
+            "total": len(logs),
+            "logs": [
+                {
+                    "id": log.id,
+                    "timestamp": log.timestamp.isoformat(),
+                    "level": log.level,
+                    "message": log.message,
+                    "service": log.service,
+                    "source": log.source,
+                    "environment": log.environment,
+                    "host": log.host,
+                    "error_type": log.error_type,
+                    "stack_trace": log.stack_trace,
+                    "metadata": log.metadata,
+                    "ai_analysis": log.ai_analysis
+                }
+                for log in logs
+            ]
+        }
         
     except Exception as e:
-        logger.error(f"❌ Error searching logs: {e}")
+        logger.error(f"❌ Search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/logs/stats")
-async def get_stats():
+async def get_stats(db: AsyncSession = Depends(get_db)):
     """Get log statistics"""
     try:
-        # Get from Redis cache
-        stats = {
-            "by_level": {},
-            "by_service": {},
-            "by_error_type": {}
+        # Count by level
+        level_stmt = select(
+            LogEntry.level,
+            func.count(LogEntry.id).label('count')
+        ).group_by(LogEntry.level)
+        
+        level_result = await db.execute(level_stmt)
+        by_level = {row.level: row.count for row in level_result}
+        
+        # Count by service
+        service_stmt = select(
+            LogEntry.service,
+            func.count(LogEntry.id).label('count')
+        ).group_by(LogEntry.service).limit(10)
+        
+        service_result = await db.execute(service_stmt)
+        by_service = {row.service: row.count for row in service_result}
+        
+        # Total count
+        total_stmt = select(func.count()).select_from(LogEntry)
+        total_result = await db.execute(total_stmt)
+        total = total_result.scalar()
+        
+        return {
+            "total_logs": total,
+            "by_level": by_level,
+            "by_service": by_service,
+            "queue_stats": log_queue.get_stats()
         }
         
-        if cache.client:
-            # Get level counts
-            level_counts = await cache.client.hgetall('stats:logs:level')
-            stats["by_level"] = {k: int(v) for k, v in level_counts.items()}
-            
-            # Get service counts
-            service_counts = await cache.client.hgetall('stats:logs:service')
-            stats["by_service"] = {k: int(v) for k, v in service_counts.items()}
-            
-            # Get error type counts
-            error_counts = await cache.client.hgetall('stats:errors:type')
-            stats["by_error_type"] = {k: int(v) for k, v in error_counts.items()}
-        
-        return stats
-        
     except Exception as e:
-        logger.error(f"❌ Error getting stats: {e}")
+        logger.error(f"❌ Stats error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================
 # AI ANALYSIS
 # ============================================
 
-@app.post("/api/ai/analyze")
-async def analyze_log_with_ai(log_data: dict):
-    """Analyze a log with Groq AI"""
-    try:
-        if not groq_service.client:
-            raise HTTPException(status_code=503, detail="Groq AI not configured")
-        
-        analysis = await groq_service.analyze_log(log_data)
-        
-        return {
-            "log": log_data,
-            "analysis": analysis
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error analyzing log: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/api/ai/summarize")
-async def summarize_logs_with_ai(
+async def summarize_logs(
     start_time: str,
     end_time: str,
     level: Optional[str] = None,
-    service: Optional[str] = None
+    db: AsyncSession = Depends(get_db)
 ):
-    """Generate AI summary of logs"""
+    """Generate AI summary"""
     try:
         if not groq_service.client:
             raise HTTPException(status_code=503, detail="Groq AI not configured")
         
         # Fetch logs
-        results = await opensearch.search_logs(
-            level=level,
-            service=service,
-            start_time=start_time,
-            end_time=end_time,
-            size=100
+        stmt = select(LogEntry).where(
+            and_(
+                LogEntry.timestamp >= datetime.fromisoformat(start_time),
+                LogEntry.timestamp <= datetime.fromisoformat(end_time)
+            )
         )
         
-        logs = results.get('logs', [])
+        if level:
+            stmt = stmt.where(LogEntry.level == level)
+        
+        stmt = stmt.order_by(LogEntry.timestamp.desc()).limit(50)
+        
+        result = await db.execute(stmt)
+        logs = result.scalars().all()
         
         if not logs:
-            return {"summary": "No logs found for the specified period"}
+            return {"summary": "No logs found"}
         
-        # Generate summary
-        summary = await groq_service.summarize_logs(logs)
+        # Convert to dict for Groq
+        log_dicts = [
+            {
+                "level": log.level,
+                "service": log.service,
+                "message": log.message,
+                "timestamp": log.timestamp.isoformat()
+            }
+            for log in logs
+        ]
+        
+        summary = await groq_service.summarize_logs(log_dicts)
         
         return {
             "period": {"start": start_time, "end": end_time},
@@ -319,69 +419,7 @@ async def summarize_logs_with_ai(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error summarizing: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/ai/rca")
-async def perform_root_cause_analysis(
-    start_time: str,
-    end_time: str,
-    services: Optional[List[str]] = None
-):
-    """Perform root cause analysis"""
-    try:
-        if not groq_service.client:
-            raise HTTPException(status_code=503, detail="Groq AI not configured")
-        
-        # Fetch error logs
-        error_logs = []
-        for level in ['ERROR', 'CRITICAL', 'FATAL']:
-            results = await opensearch.search_logs(
-                level=level,
-                start_time=start_time,
-                end_time=end_time,
-                size=500
-            )
-            error_logs.extend(results.get('logs', []))
-        
-        if not error_logs:
-            return {"analysis": "No errors found in the specified period"}
-        
-        # Prepare context
-        context = {
-            "time_period": f"{start_time} to {end_time}",
-            "services": list(set(log['service'] for log in error_logs)),
-            "error_count": len(error_logs)
-        }
-        
-        # Perform RCA
-        rca = await groq_service.perform_rca(error_logs[:50], context)
-        
-        return {
-            "period": {"start": start_time, "end": end_time},
-            "total_errors": len(error_logs),
-            "affected_services": context['services'],
-            "root_cause_analysis": rca
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error performing RCA: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ============================================
-# STREAM MANAGEMENT
-# ============================================
-
-@app.get("/api/stream/info")
-async def get_stream_info():
-    """Get Redis Stream info"""
-    try:
-        info = await stream_service.get_stream_info()
-        return info
-    except Exception as e:
-        logger.error(f"❌ Error getting stream info: {e}")
+        logger.error(f"❌ Summarization error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================
@@ -390,14 +428,18 @@ async def get_stream_info():
 
 @app.websocket("/ws/logs")
 async def websocket_logs(websocket: WebSocket):
-    """WebSocket endpoint for real-time logs"""
+    """Real-time log streaming"""
     await websocket.accept()
     active_websockets.append(websocket)
     logger.info(f"📡 WebSocket connected. Total: {len(active_websockets)}")
     
     try:
+        # Send recent logs on connect
+        recent = log_queue.get_recent_logs(10)
+        for log in recent:
+            await websocket.send_json(log)
+        
         while True:
-            # Keep connection alive
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text("pong")
@@ -411,7 +453,7 @@ async def websocket_logs(websocket: WebSocket):
             active_websockets.remove(websocket)
 
 async def broadcast_to_websockets(log_data: dict):
-    """Broadcast log to all connected WebSockets"""
+    """Broadcast to all WebSocket clients"""
     if not active_websockets:
         return
     
@@ -419,28 +461,43 @@ async def broadcast_to_websockets(log_data: dict):
     for ws in active_websockets:
         try:
             await ws.send_json(log_data)
-        except Exception as e:
-            logger.error(f"❌ Error broadcasting: {e}")
+        except:
             disconnected.append(ws)
     
-    # Remove disconnected
     for ws in disconnected:
         if ws in active_websockets:
             active_websockets.remove(ws)
 
 # ============================================
-# RUN
+# ADMIN ENDPOINTS
 # ============================================
 
-if __name__ == "__main__":
-    import uvicorn
-    
-    port = int(os.environ.get("PORT", 8000))
-    
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=settings.DEBUG,
-        log_level="info"
-    )
+@app.delete("/api/admin/cleanup")
+async def cleanup_old_logs(
+    days: int = Query(7, ge=1, le=30),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete logs older than X days (FREE tier storage management)"""
+    try:
+        cutoff_date = datetime.utcnow() - timedelta(days=days)
+        
+        stmt = select(func.count()).select_from(LogEntry).where(
+            LogEntry.timestamp < cutoff_date
+        )
+        result = await db.execute(stmt)
+        count = result.scalar()
+        
+        # Delete old logs
+        delete_stmt = LogEntry.__table__.delete().where(
+            LogEntry.timestamp < cutoff_date
+        )
+        await db.execute(delete_stmt)
+        await db.commit()
+        
+        return {
+            "deleted": count,
+            "cutoff_date": cutoff_date.isoformat()
+        }
+    except Exception as e:
+            logger.error(f"❌ Cleanup error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))           

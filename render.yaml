@@ -1,102 +1,38 @@
-# render.yaml
 services:
-  # FastAPI Backend
+  # Single web service (includes background processing)
   - type: web
-    name: ai-devops-api
+    name: ai-devops-free
     runtime: python
     region: oregon
-    plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    plan: free  # FREE TIER!
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && uvicorn api.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: ai-devops-redis
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ai-devops-db
           property: connectionString
       - key: GROQ_API_KEY
-        sync: false
-      - key: OPENSEARCH_HOST
-        sync: false
-      - key: OPENSEARCH_PORT
-        value: 443
-      - key: OPENSEARCH_USERNAME
-        sync: false
-      - key: OPENSEARCH_PASSWORD
-        sync: false
-      - key: OPENSEARCH_USE_SSL
-        value: true
-      - key: POSTGRES_HOST
-        fromDatabase:
-          name: ai-devops-db
-          property: host
-      - key: POSTGRES_PORT
-        fromDatabase:
-          name: ai-devops-db
-          property: port
-      - key: POSTGRES_USER
-        fromDatabase:
-          name: ai-devops-db
-          property: user
-      - key: POSTGRES_PASSWORD
-        fromDatabase:
-          name: ai-devops-db
-          property: password
-      - key: POSTGRES_DB
-        fromDatabase:
-          name: ai-devops-db
-          property: database
+        sync: false  # Add manually in Render dashboard
       - key: ENVIRONMENT
         value: production
       - key: DEBUG
         value: false
+      - key: QUEUE_MAX_SIZE
+        value: 10000
+      - key: BATCH_SIZE
+        value: 50
+      - key: LOG_RETENTION_DAYS
+        value: 7
     healthCheckPath: /health
     autoDeploy: true
 
-  # Stream Consumer Worker
-  - type: worker
-    name: ai-devops-consumer
-    runtime: python
-    region: oregon
-    plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: python -m consumers.stream_consumer
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: ai-devops-redis
-          property: connectionString
-      - key: GROQ_API_KEY
-        sync: false
-      - key: OPENSEARCH_HOST
-        sync: false
-      - key: OPENSEARCH_USERNAME
-        sync: false
-      - key: OPENSEARCH_PASSWORD
-        sync: false
-      - key: OPENSEARCH_USE_SSL
-        value: true
-      - key: ENVIRONMENT
-        value: production
-    autoDeploy: true
-
-  # Redis
-  - type: redis
-    name: ai-devops-redis
-    region: oregon
-    plan: standard
-    maxmemoryPolicy: noeviction
-    ipAllowList: []
-
 databases:
-  # PostgreSQL
+  # PostgreSQL free tier
   - name: ai-devops-db
-    region: oregon
-    plan: starter
-    databaseName: devops_metadata
+    databaseName: devops_logs
     user: devops
+    plan: free  # FREE TIER! (256MB storage)
+    region: oregon
