@@ -3,6 +3,7 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.pool import NullPool
 from config.settings import get_settings
+from sqlalchemy import text
 import logging
 import re
 
@@ -55,7 +56,7 @@ async def init_db():
     
     async with engine.begin() as conn:
         # Enable pg_trgm for search
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
 
         # Create tables
         await conn.run_sync(Base.metadata.create_all)
