@@ -43,6 +43,7 @@ async def process_queue_continuously():
     logger.info("🚀 Starting in-process queue consumer...")
     
     from database.connection import async_session_maker
+    from datetime import datetime
     
     while True:
         try:
@@ -72,25 +73,35 @@ async def process_queue_continuously():
             if processed_logs:
                 async with async_session_maker() as session:
                     try:
-                        # Convert to ORM objects
-                        log_entries = [
-                            LogEntry(
-                                id=log['id'],
-                                timestamp=log['timestamp'],
-                                level=log['level'],
-                                message=log['message'],
-                                service=log['service'],
-                                source=log['source'],
-                                environment=log['environment'],
-                                host=log['host'],
-                                error_type=log['error_type'],
-                                stack_trace=log['stack_trace'],
-                                metadata=log['metadata'],
-                                ai_analysis=log['ai_analysis']
+                        log_entries = []
+
+                        for log in processed_logs:
+
+                            # --- FIX 1: Timestamp conversion ---
+                            ts = log["timestamp"]
+                            if isinstance(ts, str):
+                                ts = datetime.fromisoformat(
+                                    ts.replace("Z", "+00:00")
+                                )
+
+                            # --- FIX 2: metadata_ instead of metadata ---
+                            entry = LogEntry(
+                                id=log.get("id"),
+                                timestamp=ts,
+                                level=log.get("level"),
+                                message=log.get("message"),
+                                service=log.get("service"),
+                                source=log.get("source"),
+                                environment=log.get("environment"),
+                                host=log.get("host"),
+                                error_type=log.get("error_type"),
+                                stack_trace=log.get("stack_trace"),
+                                metadata_=log.get("metadata"),
+                                ai_analysis=log.get("ai_analysis")
                             )
-                            for log in processed_logs
-                        ]
-                        
+
+                            log_entries.append(entry)
+
                         session.add_all(log_entries)
                         await session.commit()
                         
@@ -111,6 +122,7 @@ async def process_queue_continuously():
         except Exception as e:
             logger.error(f"❌ Error in processing loop: {e}")
             await asyncio.sleep(5)
+
 
 # ============================================
 # LIFESPAN EVENTS
