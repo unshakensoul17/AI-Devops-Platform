@@ -19,7 +19,7 @@ class LogEntry(Base):
     host = Column(String(255))
     error_type = Column(String(50), index=True)
     stack_trace = Column(Text)
-    metadata = Column(JSONB)
+    metadata_ = Column("metadata", JSONB)
     ai_analysis = Column(JSONB)
     created_at = Column(DateTime, default=datetime.utcnow)
     
