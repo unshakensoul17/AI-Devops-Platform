@@ -114,7 +114,7 @@ async def process_queue_continuously():
                         for log in processed_logs:
                             await broadcast_to_websockets(log)
                         alerts = detect_alerts(processed_logs)
-
+                        logger.info(f"🚨 ALERT ENGINE OUTPUT: {alerts}")
                         for alert in alerts:
                             await send_telegram_alert(
                                 f"🚨 *AI Log Alert*\n\n{alert}"
