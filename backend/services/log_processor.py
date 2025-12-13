@@ -4,6 +4,7 @@ import hashlib
 from datetime import datetime
 from typing import Dict, Any, Optional
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ class LogProcessor:
     async def process(self, raw_log: Dict[str, Any]) -> Dict[str, Any]:
         """Process a raw log entry"""
         processed = {
-            'id': self._generate_log_id(raw_log),
+            'id': self._generate_log_id(),
             'timestamp': self._extract_timestamp(raw_log),
             'level': self._extract_log_level(raw_log),
             'message': self._extract_message(raw_log),
@@ -48,9 +49,8 @@ class LogProcessor:
         
         return processed
     
-    def _generate_log_id(self, log: dict) -> str:
-        content = f"{log.get('timestamp')}{log.get('message', '')}{log.get('service', '')}"
-        return hashlib.md5(content.encode()).hexdigest()[:16]
+    def _generate_log_id(self) -> str:
+        return uuid.uuid4().hex
     
     def _extract_timestamp(self, log: dict) -> datetime:
         ts = log.get('timestamp') or log.get('@timestamp')
