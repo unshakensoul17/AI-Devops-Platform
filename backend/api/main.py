@@ -15,6 +15,9 @@ from database.models import LogEntry
 from services.queue_service import log_queue
 from services.groq_service import GroqAIService
 from services.log_processor import LogProcessor
+from services.telegram_service import send_telegram_alert
+from services.alert_engine import detect_alerts
+
 
 # Setup logging
 logging.basicConfig(
@@ -110,6 +113,13 @@ async def process_queue_continuously():
                         # Broadcast to WebSockets
                         for log in processed_logs:
                             await broadcast_to_websockets(log)
+                        alerts = detect_alerts(processed_logs)
+
+                        for alert in alerts:
+                            await send_telegram_alert(
+                                f"🚨 *AI Log Alert*\n\n{alert}"
+                            )
+
                         
                     except Exception as e:
                         logger.error(f"❌ Database error: {e}")
