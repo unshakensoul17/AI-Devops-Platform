@@ -9,7 +9,7 @@ Base = declarative_base()
 class LogEntry(Base):
     __tablename__ = "logs"
     
-    id = Column(String(16), primary_key=True)
+    id = Column(String(32), primary_key=True)
     timestamp = Column(DateTime, index=True, nullable=False)
     level = Column(String(20), index=True, nullable=False)
     message = Column(Text, nullable=False)
